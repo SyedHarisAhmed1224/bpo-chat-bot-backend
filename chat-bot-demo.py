@@ -1,9 +1,10 @@
 from openai import OpenAI
 import requests
 import json
+import os
 
 client = OpenAI(
-    api_key="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",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1"
 )
 
