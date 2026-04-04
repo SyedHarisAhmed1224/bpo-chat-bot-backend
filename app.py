@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from openai import OpenAI
 import requests
 import json
 import os
 import traceback
+import re
 
 app = FastAPI()
 
@@ -28,24 +29,35 @@ client = OpenAI(
 
 conversation_store: dict[str, list[dict]] = {}
 
+# Keep this small
+MAX_HISTORY_MESSAGES = 6   # last 3 user/assistant pairs
+MAX_MESSAGE_CHARS = 1200   # trim long messages before sending
+MAX_COMPLETION_TOKENS = 800  # explicitly cap output tokens
+
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
 
+
 SYSTEM_PROMPT = """
 You are Alt Academy's student support assistant.
 
-Behavior rules:
-- Only introduce yourself if the user starts with a greeting (e.g., "hi", "hello", "hey").
-- If the first message is a direct question or request, do NOT introduce yourself — answer immediately.
+Critical response rules:
+- Never introduce yourself unless the user's message is only a greeting.
+- If the user asks a question, requests information, or describes a problem, answer directly.
+- Do not give a generic introduction before answering.
+- Do not repeat that you are here to help unless it is actually useful.
 - Never introduce yourself in the middle of a conversation.
-- Do not repeat your introduction in later turns.
-- If the user says things like "hi", "hello", "how are you", "thanks", or "no thanks",
-  respond naturally and briefly.
-- If the user says "thank you" or "no thanks", close politely instead of restarting the conversation.
-- Do not ask 'How can I help you today?' again and again unless the conversation is actually restarting.
+- Never restart the conversation unless the user clearly starts over.
+
+Behavior rules:
+- If the user says only "hi", "hello", "hey", or similar, respond briefly and naturally.
+- If the user says "thank you", "thanks", or "no thanks", respond briefly and close politely.
 - For subject questions, plan questions, billing, payment, access, or technical problems, use tools when needed.
 - If required information is missing, ask only for the missing detail.
+- If the user uses foul language like swear words point it out and politely ask them to stay professional.
+- Answer only question related to Alt Academy related, tasks like performing calculations can be answered but also question the user about the relevence to Alt Academy.
 - Do not invent subjects, plans, pricing, payment details, or account status.
 
 Tone:
@@ -53,7 +65,7 @@ Tone:
 - Clear
 - Professional
 - Short and human
-"""
+""".strip()
 
 tools = [
     {
@@ -138,6 +150,14 @@ tools = [
     }
 ]
 
+
+def clamp_text(text: str, max_chars: int = MAX_MESSAGE_CHARS) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
+
+
 def call_backend(method: str, path: str, params: dict | None = None, payload: dict | None = None):
     url = f"{API_BASE}{path}"
     try:
@@ -158,8 +178,10 @@ def call_backend(method: str, path: str, params: dict | None = None, payload: di
             "error": f"Backend error: {response.status_code}",
             "body": response.text
         }, ensure_ascii=False)
+
     except Exception as e:
         return json.dumps({"error": f"Request failed: {str(e)}"}, ensure_ascii=False)
+
 
 def get_subjects(keyword: str | None = None, level: str | None = None, board: str | None = None):
     params = {}
@@ -171,6 +193,7 @@ def get_subjects(keyword: str | None = None, level: str | None = None, board: st
         params["board"] = board
     return call_backend("GET", "/get-subjects", params=params)
 
+
 def get_plans(subject: str | None = None, level: str | None = None, exam_session: str | None = None):
     params = {}
     if subject:
@@ -181,6 +204,7 @@ def get_plans(subject: str | None = None, level: str | None = None, exam_session
         params["examSession"] = exam_session
     return call_backend("GET", "/get-plans", params=params)
 
+
 def get_payments(email: str | None = None, student_id: str | None = None):
     params = {}
     if email:
@@ -188,6 +212,7 @@ def get_payments(email: str | None = None, student_id: str | None = None):
     if student_id:
         params["studentId"] = student_id
     return call_backend("GET", "/get-payments", params=params)
+
 
 def get_payment(payment_reference: str | None = None, payment_id: str | None = None):
     params = {}
@@ -197,7 +222,14 @@ def get_payment(payment_reference: str | None = None, payment_id: str | None = N
         params["paymentId"] = payment_id
     return call_backend("GET", "/get-payment", params=params)
 
-def generate_ticket(name: str | None = None, email: str | None = None, category: str | None = None, subject: str | None = None, message: str | None = None):
+
+def generate_ticket(
+    name: str | None = None,
+    email: str | None = None,
+    category: str | None = None,
+    subject: str | None = None,
+    message: str | None = None
+):
     payload = {
         "name": name,
         "email": email,
@@ -207,6 +239,7 @@ def generate_ticket(name: str | None = None, email: str | None = None, category:
     }
     return call_backend("POST", "/generate-ticket", payload=payload)
 
+
 tool_map = {
     "get_subjects": get_subjects,
     "get_plans": get_plans,
@@ -215,14 +248,92 @@ tool_map = {
     "generate_ticket": generate_ticket,
 }
 
+
 def get_session_messages(session_id: str) -> list[dict]:
     if session_id not in conversation_store:
         conversation_store[session_id] = []
     return conversation_store[session_id]
 
+
+def trim_history(history: list[dict]) -> list[dict]:
+    filtered = []
+    for msg in history:
+        if msg.get("role") in ("user", "assistant"):
+            filtered.append({
+                "role": msg["role"],
+                "content": clamp_text(msg.get("content", ""))
+            })
+    return filtered[-MAX_HISTORY_MESSAGES:]
+
+
+def normalize_text(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def is_greeting_only(text: str) -> bool:
+    t = normalize_text(text)
+    greeting_phrases = {
+        "hi",
+        "hello",
+        "hey",
+        "heya",
+        "yo",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "how are you",
+        "thanks",
+        "thank you",
+        "no thanks",
+    }
+    return t in greeting_phrases
+
+
+def build_turn_rule(history: list[dict], user_message: str) -> str:
+    first_turn = len(history) == 0
+    greeting_only = is_greeting_only(user_message)
+
+    if first_turn and greeting_only:
+        return (
+            "This is the first user message and it is only a greeting or brief courtesy. "
+            "Respond briefly and naturally. "
+            "You may introduce yourself in one short sentence only if natural."
+        )
+
+    if first_turn and not greeting_only:
+        return (
+            "This is the first user message and it is a direct question, request, or issue. "
+            "Do not introduce yourself. "
+            "Do not greet. "
+            "Do not give a generic welcome message. "
+            "Answer immediately."
+        )
+
+    return (
+        "This is not the first turn. "
+        "Do not introduce yourself. "
+        "Do not restart the conversation. "
+        "Continue naturally and respond to the latest user message."
+    )
+
+
+def safe_json_loads(raw: str) -> dict:
+    try:
+        data = json.loads(raw or "{}")
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
+
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -230,14 +341,19 @@ def chat(req: ChatRequest):
         if not api_key:
             raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
-        print(req)
-
         history = get_session_messages(req.session_id)
+        history[:] = trim_history(history)
+
+        print('req.session_id -> ', req.session_id)
+
+        user_message = clamp_text(req.message)
+        turn_rule = build_turn_rule(history, user_message)
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": turn_rule},
             *history,
-            {"role": "user", "content": req.message},
+            {"role": "user", "content": user_message},
         ]
 
         first = client.chat.completions.create(
@@ -245,66 +361,63 @@ def chat(req: ChatRequest):
             messages=messages,
             tools=tools,
             tool_choice="auto",
+            max_tokens=MAX_COMPLETION_TOKENS,
         )
 
         assistant_message = first.choices[0].message
 
-        # save current user turn
-        history.append({"role": "user", "content": req.message})
+        history.append({"role": "user", "content": user_message})
+        history[:] = trim_history(history)
 
         if assistant_message.tool_calls:
-            assistant_tool_message = {
-                "role": "assistant",
-                "content": assistant_message.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
+            current_turn_messages = messages + [
+                {
+                    "role": "assistant",
+                    "content": assistant_message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
                         }
-                    }
-                    for tc in assistant_message.tool_calls
-                ]
-            }
-            history.append(assistant_tool_message)
+                        for tc in assistant_message.tool_calls
+                    ]
+                }
+            ]
 
-            tool_results_for_model = []
             for tc in assistant_message.tool_calls:
                 fn_name = tc.function.name
-                args = json.loads(tc.function.arguments or "{}")
+                args = safe_json_loads(tc.function.arguments)
 
                 if fn_name not in tool_map:
                     result = json.dumps({"error": f"Unknown tool: {fn_name}"})
                 else:
                     result = tool_map[fn_name](**args)
 
-                tool_msg = {
+                # Also clamp tool results so huge payloads do not explode token usage
+                current_turn_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": result
-                }
-                history.append(tool_msg)
-                tool_results_for_model.append(tool_msg)
-
-            final_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                *history
-            ]
+                    "content": clamp_text(result, 2000)
+                })
 
             final = client.chat.completions.create(
                 model=model_name,
-                messages=final_messages,
+                messages=current_turn_messages,
+                max_tokens=MAX_COMPLETION_TOKENS,
             )
 
             reply = final.choices[0].message.content or "No response generated."
-            history.append({"role": "assistant", "content": reply})
-
+            history.append({"role": "assistant", "content": clamp_text(reply)})
+            history[:] = trim_history(history)
             return {"reply": reply}
 
         reply = assistant_message.content or "No response generated."
-        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "assistant", "content": clamp_text(reply)})
+        history[:] = trim_history(history)
         return {"reply": reply}
 
     except HTTPException:
